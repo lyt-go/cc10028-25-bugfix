@@ -298,6 +298,117 @@ class TestLineageReview:
         assert result["tasks_created"] > 0
 
 
+class TestEmptyBatchQuality:
+    """零抽取批次：质检校验按来源完成情况出空批回执或留待处理队列，人工复核同步业务状态"""
+
+    def _touch_empty(self, svc, sub, name):
+        """写入零行来源文件，模拟工作进程已确认完成但恰好无记录。"""
+        path = DATA_ROOT / sub / name
+        svc._write_jsonl(path, [])
+        assert path.exists()
+        return path
+
+    def test_empty_batch_both_sources_confirmed(self):
+        """两个零行文件均已确认：出零样本质检回执，复核登记无需抽检并保留批次凭据。"""
+        batch_key = _uid("EB")
+        qsvc = ExtractQualityService()
+        self._touch_empty(qsvc, "entities", f"{batch_key}_entities.jsonl")
+        self._touch_empty(qsvc, "relations", f"{batch_key}_relations.jsonl")
+
+        result = qsvc.check_from_batch(batch_key)
+        assert "error" not in result
+        assert result["status"] == "已出报告"
+        assert result["empty_batch"] is True
+        report = result["report"]
+        # 不虚造样本：两个零行文件不得计成抽检条目
+        assert report["抽检条目"] == "0"
+        assert report["错抽数量"] == "0"
+        assert report["漏抽数量"] == "0"
+        assert "无需抽检" in report["质检结论"]
+        # 空批质检回执已持久化，且重新提交不产生重复报告条目
+        quality_file = DATA_ROOT / "quality" / f"{batch_key}_quality.jsonl"
+        assert quality_file.exists()
+        qsvc.check_from_batch(batch_key)
+        persisted = qsvc._read_jsonl(quality_file)
+        assert len(persisted) == 1
+        assert persisted[0]["抽检条目"] == "0"
+
+        # 人工复核读取空批质检回执：登记无需抽检，保留批次凭据
+        rsvc = AnnotReviewService()
+        rresult = rsvc.create_review_tasks(batch_key)
+        assert rresult["tasks_created"] == 0
+        assert rresult["business_status"] == "无需抽检"
+        receipts = rsvc._read_jsonl(DATA_ROOT / "reviews" / f"{batch_key}_reviews.jsonl")
+        assert len(receipts) == 1
+        assert receipts[0]["复核结论"] == "无需抽检"
+        assert receipts[0]["批次凭据"] == f"QC-{batch_key}"
+        assert receipts[0]["status"] == "无需抽检"
+
+    def test_empty_batch_partial_output_stays_pending(self):
+        """仅一个完成文件：质检留待处理队列并说明原因，复核登记仍待上游；补齐后重新提交。"""
+        batch_key = _uid("EB")
+        qsvc = ExtractQualityService()
+        # 仅实体工作进程产出（含低置信度记录），关系来源缺失 = 部分失败
+        self._touch_empty(qsvc, "entities", f"{batch_key}_entities.jsonl")
+        qsvc._write_jsonl(DATA_ROOT / "entities" / f"{batch_key}_entities.jsonl", [
+            {"entity_id": "ENT-1", "chunk_id": "C1", "entity_type": "ORG",
+             "entity_text": "某集团", "confidence": 0.5},
+        ])
+
+        # 抽取部分失败：不出报告，留在待处理队列并说明原因
+        result = qsvc.check_from_batch(batch_key)
+        assert result["status"] == "待处理"
+        assert result["pending"] is True
+        assert "关系" in result["reason"]
+        assert "report" not in result
+        assert not (DATA_ROOT / "quality" / f"{batch_key}_quality.jsonl").exists()
+
+        # 人工复核：仍待上游，不派复核任务，回执说明原因并保留批次凭据
+        rsvc = AnnotReviewService()
+        rresult = rsvc.create_review_tasks(batch_key)
+        assert rresult["tasks_created"] == 0
+        assert rresult["business_status"] == "仍待上游"
+        receipts = rsvc._read_jsonl(DATA_ROOT / "reviews" / f"{batch_key}_reviews.jsonl")
+        assert len(receipts) == 1
+        assert receipts[0]["复核结论"] == "仍待上游"
+        assert receipts[0]["批次凭据"] == f"QC-{batch_key}"
+        assert "关系" in receipts[0]["退回原因"]
+
+        # 补齐第二个文件后重新提交检查：面板出报告，任务回执同步刷新
+        self._touch_empty(qsvc, "relations", f"{batch_key}_relations.jsonl")
+        result2 = qsvc.check_from_batch(batch_key)
+        assert result2["status"] == "已出报告"
+        assert result2["empty_batch"] is False
+        # 实体文件1条记录 → 抽检1条，空关系文件贡献0条
+        assert result2["report"]["抽检条目"] == "1"
+        persisted = qsvc._read_jsonl(DATA_ROOT / "quality" / f"{batch_key}_quality.jsonl")
+        assert len(persisted) == 1
+
+        rresult2 = rsvc.create_review_tasks(batch_key)
+        assert rresult2["business_status"] == "待复核"
+        assert rresult2["tasks_created"] == 1
+        receipts2 = rsvc._read_jsonl(DATA_ROOT / "reviews" / f"{batch_key}_reviews.jsonl")
+        assert len(receipts2) == 1
+        assert receipts2[0]["status"] == "待复核"
+        assert "某集团" in receipts2[0]["复核对象"]
+
+    def test_empty_batch_no_phantom_samples(self):
+        """两个零行文件不得虚造样本：报告条数为0且与人工复核回执一致。"""
+        batch_key = _uid("EB")
+        qsvc = ExtractQualityService()
+        self._touch_empty(qsvc, "entities", f"{batch_key}_entities.jsonl")
+        self._touch_empty(qsvc, "relations", f"{batch_key}_relations.jsonl")
+
+        result = qsvc.check_from_batch(batch_key)
+        assert result["report"]["抽检条目"] == "0"
+        assert result["accuracy"] is None
+
+        rresult = AnnotReviewService().create_review_tasks(batch_key)
+        # 面板（抽检0条）与复核回执（无需抽检）对得上
+        assert rresult["tasks_created"] == 0
+        assert rresult["business_status"] == "无需抽检"
+
+
 class TestParseRetry:
     """重采与中断恢复"""
 

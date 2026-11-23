@@ -1,6 +1,8 @@
 """抽取质量服务：抽取结果的抽样质检、错抽漏抽统计与准确率质检结论。
 
 从实体/关系抽取产物读取并进行抽样质检，生成质检报告并持久化。
+零抽取批次按来源完成情况分别处理：来源均已确认则出具空批质检回执，
+来源未产出（抽取中断或部分失败）则留在待处理队列并说明原因。
 """
 from __future__ import annotations
 
@@ -22,10 +24,42 @@ class ExtractQualityService(BaseModuleService):
     NEGATIVE_ACTIONS = []
 
     def check_from_batch(self, batch_key: str) -> dict[str, Any]:
-        """对指定批次的实体和关系抽取结果执行抽样质检，生成质检报告。"""
-        # 收集当前批次的实体产物
-        entity_files = sorted(self._data_dir("entities").glob("*.jsonl"))
-        relation_files = sorted(self._data_dir("relations").glob("*.jsonl"))
+        """对指定批次的实体和关系抽取结果执行抽样质检，生成质检报告。
+
+        零抽取数据按来源完成情况分别处理：
+        - 两种来源文件均已确认（已产出）但恰好无记录：出具零样本质检回执
+          （空批报告），抽检条目为0，不虚造样本；
+        - 任一来源文件缺失（工作进程未产出、抽取中断或部分失败）：不出报告，
+          留在待处理队列并说明原因，等待补齐后重新提交。
+        """
+        # 定位本批次的两种来源产物：实体抽取结果 + 关系抽取结果
+        entity_files = self._batch_source_files("entities", batch_key, "_entities")
+        relation_files = self._batch_source_files("relations", batch_key, "_relations")
+
+        # 核对来源完成状态：文件已产出才视为该工作进程已确认完成
+        missing_sources = []
+        if not entity_files:
+            missing_sources.append("实体抽取产物")
+        if not relation_files:
+            missing_sources.append("关系抽取产物")
+
+        # 抽取中断或部分失败：任一来源未产出，留在待处理队列并说明原因
+        if missing_sources:
+            reason = ("、".join(missing_sources)
+                      + "尚未产出，抽取可能中断或部分失败，待上游补齐后重新提交质检")
+            self._write_checkpoint(f"quality_{batch_key}", {
+                "batch_key": batch_key,
+                "status": "待处理",
+                "pending_reason": reason,
+                "missing_sources": missing_sources,
+            })
+            return {
+                "batch_key": batch_key,
+                "status": "待处理",
+                "pending": True,
+                "reason": reason,
+                "missing_sources": missing_sources,
+            }
 
 # 数据操作：校验抽取结果数据集执行抽样质检统计
         sample_ratio = 0.1
@@ -33,10 +67,13 @@ class ExtractQualityService(BaseModuleService):
         total_relations = 0
         correct_entities = 0
         correct_relations = 0
+        total_records = 0
 
         for ef in entity_files:
             entities = self._read_jsonl(ef)
-            sample_size = max(1, int(len(entities) * sample_ratio))
+            total_records += len(entities)
+            # 空文件贡献0条抽检样本，不虚造；非空文件至少抽1条且不超过总量
+            sample_size = min(len(entities), max(1, int(len(entities) * sample_ratio)))
             total_entities += sample_size
             # 抽样质检：模拟95%准确率
             correct = int(sample_size * 0.95)
@@ -44,13 +81,45 @@ class ExtractQualityService(BaseModuleService):
 
         for rf in relation_files:
             relations = self._read_jsonl(rf)
-            sample_size = max(1, int(len(relations) * sample_ratio))
+            total_records += len(relations)
+            sample_size = min(len(relations), max(1, int(len(relations) * sample_ratio)))
             total_relations += sample_size
             correct = int(sample_size * 0.88)
             correct_relations += correct
 
-        if total_entities == 0 and total_relations == 0:
-            return {"error": f"批次 {batch_key} 无可用抽取结果进行质检"}
+        # 两种来源均已确认完成且恰好无任何记录：出具零样本质检回执（空批报告）
+        if total_records == 0:
+            conclusion = "空批次：两种来源文件均已确认完成且无抽取记录，无需抽检"
+            report = {
+                "报告编号": f"QC-{batch_key}",
+                "批次编号": batch_key,
+                "抽样比例": str(sample_ratio),
+                "抽检条目": "0",
+                "错抽数量": "0",
+                "漏抽数量": "0",
+                "准确率": "N/A",
+                "质检结论": conclusion,
+            }
+            self._write_checkpoint(f"quality_{batch_key}", {
+                "batch_key": batch_key,
+                "status": "已出报告",
+                "empty_batch": True,
+                "sample_ratio": sample_ratio,
+                "total_items": 0,
+                "total_records": 0,
+                "accuracy": None,
+                "conclusion": conclusion,
+            })
+            output_path = self._data_dir("quality") / f"{batch_key}_quality.jsonl"
+            self._rewrite_jsonl(output_path, [report])
+            return {
+                "batch_key": batch_key,
+                "status": "已出报告",
+                "empty_batch": True,
+                "report": report,
+                "accuracy": None,
+                "output": str(output_path),
+            }
 
         total_items = total_entities + total_relations
         total_correct = correct_entities + correct_relations
@@ -83,17 +152,22 @@ class ExtractQualityService(BaseModuleService):
         # 写入质检查点
         self._write_checkpoint(f"quality_{batch_key}", {
             "batch_key": batch_key,
+            "status": "已出报告",
+            "empty_batch": False,
             "sample_ratio": sample_ratio,
             "total_items": total_items,
+            "total_records": total_records,
             "accuracy": accuracy,
             "conclusion": conclusion,
         })
 
         output_path = self._data_dir("quality") / f"{batch_key}_quality.jsonl"
-        self._write_jsonl(output_path, [report])
+        self._rewrite_jsonl(output_path, [report])
 
         return {
             "batch_key": batch_key,
+            "status": "已出报告",
+            "empty_batch": False,
             "report": report,
             "accuracy": accuracy,
             "output": str(output_path),

@@ -141,6 +141,28 @@ class BaseModuleService:
                         continue
         return records
 
+    def _rewrite_jsonl(self, filepath: Path, records: list[dict[str, Any]]) -> int:
+        """覆盖写入JSONL文件（清空后重写），返回写入条数。
+
+        用于批次级报告/回执的重新提交：同一批次重复生成时刷新为当前状态，
+        避免追加模式在报告面板上产生重复条目。
+        """
+        _ensure_dir(filepath.parent)
+        written = 0
+        with open(filepath, "w", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+                written += 1
+        return written
+
+    def _batch_source_files(self, sub: str, batch_key: str, suffix: str) -> list[Path]:
+        """定位指定批次的来源产物文件，按批次键前缀匹配（如 BATCH*_entities.jsonl）。
+
+        文件已产出视为对应工作进程已确认完成；文件缺失视为上游尚未产出，
+        用于区分"已确认的空批次"与"抽取中断/部分失败"。
+        """
+        return sorted(self._data_dir(sub).glob(f"{batch_key}*{suffix}.jsonl"))
+
     def _write_checkpoint(self, name: str, state: dict[str, Any]) -> Path:
         """写入检查点文件，用于中断恢复与游标推进。检查点记录当前处理偏移和状态。"""
 # 数据操作：存储检查点数据管理中断恢复与游标推进
